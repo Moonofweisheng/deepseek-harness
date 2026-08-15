@@ -112,22 +112,23 @@ export interface WireDelta {
    * open a reasoning block); absent entirely in non-thinking mode.
    */
   reasoning_content?: string | null
-  tool_calls?: WireToolCallDelta[]
+  /** Streamed tool-call fragments; null is an allowed provider placeholder. */
+  tool_calls?: WireToolCallDelta[] | null
 }
 
 /** A streamed fragment of one tool call; fragments sharing an `index` concatenate into one call. */
 export interface WireToolCallDelta {
   /** Disambiguates parallel tool calls; stable across a call's deltas. */
   index: number
-  /** Present on the first delta of each call only. */
-  id?: string
-  type?: 'function'
+  /** Call-id fragment; null and empty strings are provider placeholders. */
+  id?: string | null
+  type?: 'function' | null
   function?: {
-    /** Present on the first delta of each call only. */
-    name?: string
+    /** Function-name fragment; null and empty strings are provider placeholders. */
+    name?: string | null
     /** Argument JSON fragment (concatenate across deltas). */
-    arguments?: string
-  }
+    arguments?: string | null
+  } | null
 }
 
 /**
