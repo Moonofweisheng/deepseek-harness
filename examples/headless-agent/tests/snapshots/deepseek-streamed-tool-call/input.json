@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {
+      "op": "prompt",
+      "text": "execute the deterministic fragmented tool call"
+    }
+  ]
+}

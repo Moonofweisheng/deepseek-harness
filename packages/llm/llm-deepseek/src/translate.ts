@@ -1,8 +1,9 @@
 /**
  * Translate DeepSeek SSE payloads with one stateful harness block per content, reasoning, or tool
- * call index. An empty initial reasoning delta does not open a block. Finish reason and the latest
- * usage are deferred until `[DONE]`, covering both finish-attached and trailing usage-only shapes
- * while ensuring no chunk follows `finish`.
+ * call index. Tool-call identity and arguments concatenate across fragments; incomplete identity
+ * fails when `[DONE]` closes the block. An empty initial reasoning delta does not open a block.
+ * Finish reason and the latest usage are deferred until `[DONE]`, covering both finish-attached and
+ * trailing usage-only shapes while ensuring no chunk follows `finish`.
  *
  * Translate DeepSeek wire chunks into the harness `StreamChunk` protocol.
  * @module dsh-llm-deepseek/translate
@@ -66,18 +67,27 @@ function closeBlock(block: OpenBlock): ContentBlock {
   switch (block.kind) {
     case 'text': return { type: 'text', text: block.text }
     case 'reasoning': return { type: 'reasoning', text: block.text }
-    case 'tool-call': return {
-      type: 'tool-call',
-      id: CallId(block.callId ?? ''),
-      name: block.name ?? '',
-      arguments: block.text,
+    case 'tool-call': {
+      if (block.callId === undefined) {
+        throw new LlmError(`tool-call block ${block.index} ended without an id`, 'MALFORMED_RESPONSE')
+      }
+      if (block.name === undefined) {
+        throw new LlmError(`tool-call block ${block.index} ended without a name`, 'MALFORMED_RESPONSE')
+      }
+      return {
+        type: 'tool-call',
+        id: CallId(block.callId),
+        name: block.name,
+        arguments: block.text,
+      }
     }
   }
 }
 
 /**
  * Consume SSE data payloads (ending with `[DONE]`) and yield StreamChunks.
- * Malformed JSON payloads abort the stream with `MALFORMED_RESPONSE`.
+ * Malformed JSON payloads and tool calls that end without identity abort the stream with
+ * `MALFORMED_RESPONSE`.
  * @param payloads - SSE data payloads from {@link parseSse}, `[DONE]`-terminated.
  * @returns deltas as they arrive; `block-end`s, `usage`, and `finish` are all deferred to the `[DONE]` sentinel.
  *   A `stop` (or absent) finish with no opened blocks is a degenerate provider completion and maps to an
@@ -156,8 +166,8 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
           toolBlocks.set(call.index, block)
           yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
         }
-        if (call.id !== undefined) block.callId = call.id
-        if (call.function?.name !== undefined) block.name = call.function.name
+        if (typeof call.id === 'string') block.callId = (block.callId ?? '') + call.id
+        if (typeof call.function?.name === 'string') block.name = (block.name ?? '') + call.function.name
         const fragment = call.function?.arguments ?? ''
         block.text += fragment
         yield {

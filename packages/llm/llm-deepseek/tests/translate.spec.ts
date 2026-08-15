@@ -123,6 +123,31 @@ describe('translate: tool calls', () => {
     ])
   })
 
+  it('concatenates fragmented identity and ignores empty or null placeholders', async () => {
+    const chunks = await collect(translate(feed(
+      firstChunk,
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_', type: 'function', function: { name: 'get_', arguments: '{"city"' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: '00_x', function: { name: 'weather', arguments: ': "Paris"}' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: '', function: { name: '', arguments: '' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: null, type: null, function: { name: null, arguments: null } }] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+      DONE,
+    )))
+    expect(chunks).toEqual([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 0, id: 'call_', name: 'get_', argumentsDelta: '{"city"' },
+      { type: 'tool-call-delta', index: 0, id: 'call_00_x', name: 'get_weather', argumentsDelta: ': "Paris"}' },
+      { type: 'tool-call-delta', index: 0, id: 'call_00_x', name: 'get_weather', argumentsDelta: '' },
+      { type: 'tool-call-delta', index: 0, id: 'call_00_x', name: 'get_weather', argumentsDelta: '' },
+      {
+        type: 'block-end',
+        index: 0,
+        block: { type: 'tool-call', id: 'call_00_x', name: 'get_weather', arguments: '{"city": "Paris"}' },
+      },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ])
+  })
+
   it('disambiguates parallel tool calls by wire index', async () => {
     const chunks = await collect(translate(feed(
       firstChunk,
@@ -312,20 +337,28 @@ describe('mapUsage', () => {
 })
 
 describe('translate: defensive tool-call branches', () => {
-  it('handles deltas that never carry id or name (empty-string fallbacks)', async () => {
-    const chunks = await collect(translate(feed(
+  it('rejects a completed tool call without an id', async () => {
+    await expect(collect(translate(feed(
       firstChunk,
-      // Hypothetical lenient wire: argument fragments with no id/name at all.
-      { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'f', arguments: '{}' } }] } }] },
       { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
       DONE,
-    )))
-    expect(chunks).toEqual([
-      { type: 'block-start', index: 0, blockType: 'tool-call' },
-      { type: 'tool-call-delta', index: 0, id: '', argumentsDelta: '{}' },
-      { type: 'block-end', index: 0, block: { type: 'tool-call', id: '', name: '', arguments: '{}' } },
-      { type: 'finish', reason: { kind: 'tool-calls' } },
-    ])
+    )))).rejects.toMatchObject({
+      message: 'tool-call block 0 ended without an id',
+      code: 'MALFORMED_RESPONSE',
+    })
+  })
+
+  it('rejects a completed tool call without a name', async () => {
+    await expect(collect(translate(feed(
+      firstChunk,
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: 'c', function: { arguments: '{}' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+      DONE,
+    )))).rejects.toMatchObject({
+      message: 'tool-call block 0 ended without a name',
+      code: 'MALFORMED_RESPONSE',
+    })
   })
 
   it('handles tool_call deltas with a function object but no arguments field', async () => {
@@ -342,6 +375,7 @@ describe('translate: defensive tool-call branches', () => {
     const chunks = await collect(translate(feed(
       firstChunk,
       { choices: [{ delta: { tool_calls: [{ index: 0, id: 'c' }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'f', arguments: '{}' } }] } }] },
       { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
       DONE,
     )))

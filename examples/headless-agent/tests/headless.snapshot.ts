@@ -54,6 +54,8 @@ const dshBinScript = fileURLToPath(new URL('../../../apps/cli/src/bin.ts', impor
 const tsconfigPath = fileURLToPath(new URL('../../../tsconfig.json', import.meta.url))
 const reasoningConfigPath = fileURLToPath(new URL('./fixtures/cli.cordis.yml', import.meta.url))
 const deepseekDefaultsConfigPath = fileURLToPath(new URL('./fixtures/deepseek-defaults.cordis.yml', import.meta.url))
+const deepseekToolCallScenarioDir = join(snapshotsDir, 'deepseek-streamed-tool-call')
+const deepseekToolCallStreamExpected = join(deepseekToolCallScenarioDir, 'stream-json.expected.jsonl')
 const headlessOverlayPath = fileURLToPath(new URL('./fixtures/headless-profile.cordis.yml', import.meta.url))
 const headlessSessionExpected = join(snapshotsDir, 'headless-profile', 'session.expected.jsonl')
 const headlessFailureExpected = join(snapshotsDir, 'headless-profile', 'stderr.expected.txt')
@@ -112,10 +114,56 @@ async function deepseekDefaultsServer(): Promise<DeepSeekDefaultsServer> {
   }
 }
 
+/** Serve a fragmented DeepSeek tool call followed by its deterministic final response. */
+async function deepseekToolCallServer(): Promise<DeepSeekDefaultsServer> {
+  const requests: JsonObject[] = []
+  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+    let body = ''
+    request.setEncoding('utf8')
+    request.on('data', (chunk: string) => { body += chunk })
+    request.on('end', () => {
+      requests.push(JSON.parse(body) as JsonObject)
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      const payloads = requests.length === 1
+        ? [
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_","type":"function","function":{"name":"todo_","arguments":"{\\"todos\\":[{\\"content\\":\\"confirm streamed identity\\","}}]}}]}',
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"streamed","function":{"name":"write","arguments":"\\"status\\":\\"completed\\"}]}"}}]}}]}',
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"","arguments":""}}]}}]}',
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":null,"arguments":null}}]}}]}',
+          'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}',
+          'data: [DONE]',
+          '',
+        ]
+        : [
+          'data: {"choices":[{"delta":{"content":"STREAMED_TOOL_CALL_OK"}}]}',
+          'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}}',
+          'data: [DONE]',
+          '',
+        ]
+      response.end(payloads.join('\n\n'))
+    })
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (address === null || typeof address === 'string') throw new Error('DeepSeek tool-call snapshot server has no port')
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    requests,
+    close: () => new Promise(resolve => server.close(() => { resolve() })),
+  }
+}
+
 function parseJsonl(content: string): JsonObject[] {
   return content.split('\n')
     .filter(line => line.trim().length > 0)
     .map(line => JSON.parse(line) as JsonObject)
+}
+
+function requireJsonObjects(value: unknown, label: string): JsonObject[] {
+  if (!Array.isArray(value) || value.some(item => item === null || typeof item !== 'object' || Array.isArray(item))) {
+    throw new Error(`${label} is not an array of JSON objects`)
+  }
+  return value as JsonObject[]
 }
 
 function contextFromLogs(contents: readonly string[]): NormalizeContext {
@@ -562,6 +610,49 @@ describe('headless stream-json snapshots', () => {
         maxTokens: true,
         reasoningEffort: true,
       })
+    } finally {
+      await server.close()
+    }
+  }, LOADER_SMOKE_TEST_TIMEOUT_MS)
+
+  it('executes a DeepSeek tool call assembled from fragmented and placeholder identity deltas', async () => {
+    const server = await deepseekToolCallServer()
+    const prompt = await scenarioPrompt(deepseekToolCallScenarioDir, 'deepseek-streamed-tool-call')
+    let runCwd = ''
+    try {
+      const result = await runLoaderSmoke({
+        label: 'fragmented DeepSeek tool-call headless stream-json snapshot',
+        tempDirPrefix: 'headless-snapshot-deepseek-tool-call-',
+        binScript,
+        libBinScript: binScript,
+        configPath: deepseekDefaultsConfigPath,
+        binArgs: [deepseekDefaultsConfigPath, prompt],
+        tsconfigPath,
+        env: {
+          DEEPSEEK_API_KEY: 'snapshot-key',
+          DSH_SNAPSHOT_BASE_URL: server.url,
+          NODE_OPTIONS: [process.env.NODE_OPTIONS, '--disable-warning=ExperimentalWarning'].filter(Boolean).join(' '),
+        },
+        prepare: (cwd) => { runCwd = cwd },
+      })
+
+      expect(result.stderr).toBe('')
+      expect(server.requests).toHaveLength(2)
+      const messages = requireJsonObjects(server.requests[1]?.messages, 'second DeepSeek request messages')
+      const assistant = messages.find(message => message.role === 'assistant')
+      const toolCalls = requireJsonObjects(assistant?.tool_calls, 'assistant tool calls')
+      expect(toolCalls[0]).toMatchObject({
+        id: 'call_streamed',
+        type: 'function',
+        function: { name: 'todo_write' },
+      })
+      expect(messages.find(message => message.role === 'tool')).toMatchObject({
+        role: 'tool',
+        tool_call_id: 'call_streamed',
+      })
+      const normalized = normalizeHeadlessStream(result.stdout, runCwd)
+      if (refreshing) await writeFile(deepseekToolCallStreamExpected, normalized)
+      expect(normalized).toBe(await readFile(deepseekToolCallStreamExpected, 'utf8'))
     } finally {
       await server.close()
     }
